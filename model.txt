@@ -1,0 +1,5 @@
+`Nodes:
+1,Conv2D,Convolution Layer
+2,MaxPool,Max Pooling
+Connections:
+1,2,1,1
