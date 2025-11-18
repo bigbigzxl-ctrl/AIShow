@@ -50,5 +50,8 @@ set(SOURCES
 # Executable
 add_executable(${PROJECT_NAME} ${SOURCES})
 
+# Headless execution test (does not depend on GLFW/ImGui or SyncManager)
+add_executable(ai_execution_test src/ai_execution_test.cpp src/AIModel.cpp)
+
 # Link libraries
 target_link_libraries(${PROJECT_NAME} glfw OpenGL::GL)

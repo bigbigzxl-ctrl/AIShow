@@ -1,8 +1,10 @@
 #include "AIModel.h"
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <algorithm>
 #include <chrono>
+#include <unordered_set>
 
 AIModel::AIModel()
     : onModelChange_(nullptr),
@@ -16,26 +18,121 @@ AIModel::~AIModel() {
 }
 
 void AIModel::LoadFromFile(const std::string& filename) {
-    // Simple JSON-like loading (simplified)
-    // std::ifstream file(filename);
-    // if (!file.is_open()) {
-    //     std::cerr << "Failed to open file: " << filename << std::endl;
-    //     return;
-    // }
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open file: " << filename << std::endl;
+        return;
+    }
 
-    // For simplicity, assume a basic format
-    // In real implementation, use JSON parser
     nodes_.clear();
-    connections_.clear();
+    edges_.clear();
+    allPorts_.clear();
+    portIndex_.clear();
+    nextPortId_ = 1000;
+    nextEdgeId_ = 2000;
 
-    // Dummy data for demonstration
-    AINode node1 = {1, "Conv2D", "Convolution Layer", {{"filters", "32"}, {"kernel_size", "3"}}, {0}, {1}, -1};
-    AINode node2 = {2, "MaxPool", "Max Pooling", {{"pool_size", "2"}}, {1}, {2}, -1};
+    std::string line;
+    bool parsingNodes = false;
+    bool parsingConnections = false;
 
-    nodes_.push_back(node1);
-    nodes_.push_back(node2);
-    connections_.emplace_back(1, 2, 1, 1);
+    while (std::getline(file, line)) {
+        // Trim whitespace
+        if (line.empty() || line[0] == '\n') continue;
 
+        if (line.find("Nodes:") != std::string::npos) {
+            parsingNodes = true;
+            parsingConnections = false;
+            continue;
+        }
+        if (line.find("Connections:") != std::string::npos) {
+            parsingNodes = false;
+            parsingConnections = true;
+            continue;
+        }
+
+        if (parsingNodes) {
+            // Parse: nodeId,nodeType,nodeName
+            int nodeId;
+            std::string nodeType, nodeName;
+            char comma;
+            std::istringstream iss(line);
+            iss >> nodeId >> comma >> nodeType >> comma;
+            std::getline(iss, nodeName);
+
+            if (nodeName.empty()) continue;
+
+            AINode node;
+            node.id = nodeId;
+            node.type = nodeType;
+            node.name = nodeName;
+            node.boundUINodeId = -1;
+
+            // Create default input/output ports for the node
+            Port inputPort;
+            inputPort.id = GetNextPortId();
+            inputPort.name = "input";
+            inputPort.dataType = "any";
+            inputPort.isInput = true;
+            inputPort.nodeId = nodeId;
+            node.inputPorts.push_back(inputPort);
+            allPorts_.push_back(inputPort);
+            portIndex_[inputPort.id] = allPorts_.size() - 1;
+
+            Port outputPort;
+            outputPort.id = GetNextPortId();
+            outputPort.name = "output";
+            outputPort.dataType = "any";
+            outputPort.isInput = false;
+            outputPort.nodeId = nodeId;
+            node.outputPorts.push_back(outputPort);
+            allPorts_.push_back(outputPort);
+            portIndex_[outputPort.id] = allPorts_.size() - 1;
+
+            nodes_.push_back(node);
+        }
+        else if (parsingConnections) {
+            // Parse: fromNodeId,toNodeId,fromPortIndex,toPortIndex
+            int fromNodeId, toNodeId, fromPortIdx, toPortIdx;
+            char comma;
+            std::istringstream iss(line);
+            iss >> fromNodeId >> comma >> toNodeId >> comma >> fromPortIdx >> comma >> toPortIdx;
+
+            // Find the ports
+            const Port* fromPort = nullptr;
+            const Port* toPort = nullptr;
+
+            // Find nodes
+            AINode* fromNode = nullptr;
+            AINode* toNode = nullptr;
+            for (auto& node : nodes_) {
+                if (node.id == fromNodeId) fromNode = &node;
+                if (node.id == toNodeId) toNode = &node;
+            }
+
+            if (!fromNode || !toNode) continue;
+            
+            // Get the output port from source node
+            if (fromPortIdx < fromNode->outputPorts.size()) {
+                fromPort = &fromNode->outputPorts[fromPortIdx];
+            }
+            
+            // Get the input port from target node
+            if (toPortIdx < toNode->inputPorts.size()) {
+                toPort = &toNode->inputPorts[toPortIdx];
+            }
+
+            if (fromPort && toPort) {
+                Edge edge;
+                edge.id = GetNextEdgeId();
+                edge.fromPortId = fromPort->id;
+                edge.toPortId = toPort->id;
+                edge.dataType = "any"; // Default data type
+                edges_.push_back(edge);
+            }
+        }
+    }
+
+    file.close();
     if (onModelChange_) onModelChange_();
 }
 
@@ -46,27 +143,121 @@ void AIModel::SaveToFile(const std::string& filename) {
         return;
     }
 
-    // Simple saving
+    // Save nodes
     file << "Nodes:\n";
     for (const auto& node : nodes_) {
         file << node.id << "," << node.type << "," << node.name << "\n";
     }
+
+    // Save edges (connections)
     file << "Connections:\n";
-    for (const auto& conn : connections_) {
-        file << std::get<0>(conn) << "," << std::get<1>(conn) << "," << std::get<2>(conn) << "," << std::get<3>(conn) << "\n";
+    for (const auto& edge : edges_) {
+        // Find port indices for backward compatibility
+        const Port* fromPort = GetPort(edge.fromPortId);
+        const Port* toPort = GetPort(edge.toPortId);
+        
+        if (fromPort && toPort) {
+            // Find the node and port index
+            int fromPortIdx = 0, toPortIdx = 0;
+            
+            for (const auto& node : nodes_) {
+                if (node.id == fromPort->nodeId) {
+                    for (size_t i = 0; i < node.outputPorts.size(); i++) {
+                        if (node.outputPorts[i].id == fromPort->id) {
+                            fromPortIdx = i;
+                            break;
+                        }
+                    }
+                }
+                if (node.id == toPort->nodeId) {
+                    for (size_t i = 0; i < node.inputPorts.size(); i++) {
+                        if (node.inputPorts[i].id == toPort->id) {
+                            toPortIdx = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            file << fromPort->nodeId << "," << toPort->nodeId << "," 
+                 << fromPortIdx << "," << toPortIdx << "\n";
+        }
     }
+    
+    file.close();
 }
 
 void AIModel::AddNode(const AINode& node) {
-    nodes_.push_back(node);
+    AINode newNode = node;
+    
+    // If the node doesn't have ports, create default ones
+    if (newNode.inputPorts.empty()) {
+        Port inputPort;
+        inputPort.id = GetNextPortId();
+        inputPort.name = "input";
+        inputPort.dataType = "any";
+        inputPort.isInput = true;
+        inputPort.nodeId = newNode.id;
+        newNode.inputPorts.push_back(inputPort);
+        allPorts_.push_back(inputPort);
+        portIndex_[inputPort.id] = allPorts_.size() - 1;
+    } else {
+        // Register existing ports
+        for (auto& port : newNode.inputPorts) {
+            if (port.id <= 0) port.id = GetNextPortId();
+            port.nodeId = newNode.id;
+            allPorts_.push_back(port);
+            portIndex_[port.id] = allPorts_.size() - 1;
+        }
+    }
+    
+    if (newNode.outputPorts.empty()) {
+        Port outputPort;
+        outputPort.id = GetNextPortId();
+        outputPort.name = "output";
+        outputPort.dataType = "any";
+        outputPort.isInput = false;
+        outputPort.nodeId = newNode.id;
+        newNode.outputPorts.push_back(outputPort);
+        allPorts_.push_back(outputPort);
+        portIndex_[outputPort.id] = allPorts_.size() - 1;
+    } else {
+        // Register existing ports
+        for (auto& port : newNode.outputPorts) {
+            if (port.id <= 0) port.id = GetNextPortId();
+            port.nodeId = newNode.id;
+            allPorts_.push_back(port);
+            portIndex_[port.id] = allPorts_.size() - 1;
+        }
+    }
+    
+    nodes_.push_back(newNode);
     if (onModelChange_) onModelChange_();
 }
 
 void AIModel::RemoveNode(int nodeId) {
+    // Remove all edges connected to this node
+    edges_.erase(std::remove_if(edges_.begin(), edges_.end(),
+        [this, nodeId](const Edge& edge) {
+            const Port* fromPort = GetPort(edge.fromPortId);
+            const Port* toPort = GetPort(edge.toPortId);
+            return (fromPort && fromPort->nodeId == nodeId) || (toPort && toPort->nodeId == nodeId);
+        }), edges_.end());
+
+    // Remove all ports belonging to this node
+    allPorts_.erase(std::remove_if(allPorts_.begin(), allPorts_.end(),
+        [nodeId](const Port& port) { return port.nodeId == nodeId; }), allPorts_.end());
+
+    // Rebuild port index
+    portIndex_.clear();
+    for (size_t i = 0; i < allPorts_.size(); i++) {
+        portIndex_[allPorts_[i].id] = i;
+    }
+
+    // Remove the node itself
     nodes_.erase(std::remove_if(nodes_.begin(), nodes_.end(),
         [nodeId](const AINode& node) { return node.id == nodeId; }), nodes_.end());
-    connections_.erase(std::remove_if(connections_.begin(), connections_.end(),
-        [nodeId](const std::tuple<int, int, int, int>& conn) { return std::get<0>(conn) == nodeId || std::get<1>(conn) == nodeId; }), connections_.end());
+
     if (onModelChange_) onModelChange_();
 }
 
@@ -80,30 +271,223 @@ void AIModel::UpdateNode(const AINode& updatedNode) {
     if (onModelChange_) onModelChange_();
 }
 
-void AIModel::AddConnection(int fromNode, int toNode, int fromOutput, int toInput) {
-    connections_.emplace_back(fromNode, toNode, fromOutput, toInput);
+// New Edge-based connection methods
+void AIModel::AddEdge(const Edge& edge) {
+    if (!ValidateEdge(edge)) {
+        std::cerr << "AIModel::AddEdge: Invalid edge configuration" << std::endl;
+        return;
+    }
+    Edge newEdge = edge;
+    if (newEdge.id <= 0) newEdge.id = GetNextEdgeId();
+    edges_.push_back(newEdge);
     if (onModelChange_) onModelChange_();
+}
+
+void AIModel::RemoveEdge(int edgeId) {
+    edges_.erase(std::remove_if(edges_.begin(), edges_.end(),
+        [edgeId](const Edge& edge) { return edge.id == edgeId; }), edges_.end());
+    if (onModelChange_) onModelChange_();
+}
+
+void AIModel::RemoveEdgesBetweenNodes(int fromNodeId, int toNodeId) {
+    edges_.erase(std::remove_if(edges_.begin(), edges_.end(),
+        [this, fromNodeId, toNodeId](const Edge& edge) {
+            const Port* fromPort = GetPort(edge.fromPortId);
+            const Port* toPort = GetPort(edge.toPortId);
+            return (fromPort && fromPort->nodeId == fromNodeId &&
+                    toPort && toPort->nodeId == toNodeId);
+        }), edges_.end());
+    if (onModelChange_) onModelChange_();
+}
+
+// Port lookup methods
+const Port* AIModel::GetPort(int portId) const {
+    auto it = portIndex_.find(portId);
+    if (it != portIndex_.end()) {
+        int idx = it->second;
+        if (idx >= 0 && idx < static_cast<int>(allPorts_.size())) {
+            return &allPorts_[idx];
+        }
+    }
+    return nullptr;
+}
+
+std::vector<const Port*> AIModel::GetNodeInputPorts(int nodeId) const {
+    std::vector<const Port*> result;
+    for (const auto& port : allPorts_) {
+        if (port.nodeId == nodeId && port.isInput) {
+            result.push_back(&port);
+        }
+    }
+    return result;
+}
+
+std::vector<const Port*> AIModel::GetNodeOutputPorts(int nodeId) const {
+    std::vector<const Port*> result;
+    for (const auto& port : allPorts_) {
+        if (port.nodeId == nodeId && !port.isInput) {
+            result.push_back(&port);
+        }
+    }
+    return result;
+}
+
+// Edge validation
+bool AIModel::ValidateEdge(const Edge& edge) const {
+    const Port* fromPort = GetPort(edge.fromPortId);
+    const Port* toPort = GetPort(edge.toPortId);
+    
+    if (!fromPort || !toPort) {
+        std::cerr << "ValidateEdge: Port not found" << std::endl;
+        return false;
+    }
+    
+    // fromPort must be output, toPort must be input
+    if (fromPort->isInput || !toPort->isInput) {
+        std::cerr << "ValidateEdge: Invalid port directions" << std::endl;
+        return false;
+    }
+    
+    // Cannot connect port to itself
+    if (fromPort->nodeId == toPort->nodeId) {
+        std::cerr << "ValidateEdge: Cannot connect port to same node" << std::endl;
+        return false;
+    }
+    
+    // Data types should match (if both are not "any")
+    if (fromPort->dataType != "any" && toPort->dataType != "any" &&
+        fromPort->dataType != toPort->dataType) {
+        std::cerr << "ValidateEdge: Data type mismatch: "
+                  << fromPort->dataType << " != " << toPort->dataType << std::endl;
+        return false;
+    }
+    
+    return true;
+}
+
+// Backward compatibility: return edges in old tuple format
+std::vector<std::tuple<int, int, int, int>> AIModel::GetConnectionsLegacy() const {
+    std::vector<std::tuple<int, int, int, int>> result;
+    for (const auto& edge : edges_) {
+        const Port* fromPort = GetPort(edge.fromPortId);
+        const Port* toPort = GetPort(edge.toPortId);
+        
+        if (fromPort && toPort) {
+            // Find port indices
+            int fromIdx = 0, toIdx = 0;
+            
+            for (const auto& node : nodes_) {
+                if (node.id == fromPort->nodeId) {
+                    for (size_t i = 0; i < node.outputPorts.size(); i++) {
+                        if (node.outputPorts[i].id == fromPort->id) {
+                            fromIdx = i;
+                            break;
+                        }
+                    }
+                }
+                if (node.id == toPort->nodeId) {
+                    for (size_t i = 0; i < node.inputPorts.size(); i++) {
+                        if (node.inputPorts[i].id == toPort->id) {
+                            toIdx = i;
+                            break;
+                        }
+                    }
+                }
+            }
+            
+            result.emplace_back(fromPort->nodeId, toPort->nodeId, fromIdx, toIdx);
+        }
+    }
+    return result;
+}
+
+// Legacy connection methods for backward compatibility
+void AIModel::AddConnection(int fromNode, int toNode, int fromOutput, int toInput) {
+    // Find the ports
+    AINode* fromNodePtr = nullptr;
+    AINode* toNodePtr = nullptr;
+    for (auto& node : nodes_) {
+        if (node.id == fromNode) fromNodePtr = &node;
+        if (node.id == toNode) toNodePtr = &node;
+    }
+    
+    if (!fromNodePtr || !toNodePtr) return;
+    if (fromOutput >= static_cast<int>(fromNodePtr->outputPorts.size())) return;
+    if (toInput >= static_cast<int>(toNodePtr->inputPorts.size())) return;
+    
+    Edge edge;
+    edge.id = GetNextEdgeId();
+    edge.fromPortId = fromNodePtr->outputPorts[fromOutput].id;
+    edge.toPortId = toNodePtr->inputPorts[toInput].id;
+    edge.dataType = "any";
+    AddEdge(edge);
 }
 
 void AIModel::RemoveConnection(int fromNode, int toNode) {
-    connections_.erase(std::remove_if(connections_.begin(), connections_.end(),
-        [fromNode, toNode](const std::tuple<int, int, int, int>& conn) { return std::get<0>(conn) == fromNode && std::get<1>(conn) == toNode; }), connections_.end());
-    if (onModelChange_) onModelChange_();
+    RemoveEdgesBetweenNodes(fromNode, toNode);
 }
 
 void AIModel::StartExecution(int numThreads) {
+    // If there are leftover worker threads from a previous run, join them first
+    if (!workerThreads_.empty()) {
+        for (auto& t : workerThreads_) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        workerThreads_.clear();
+    }
+
     if (executing_) return;
 
     numThreads_ = numThreads;
     executing_ = true;
 
-    // Initialize execution queue with all nodes
-    {
-        std::lock_guard<std::mutex> lock(queueMutex_);
-        for (const auto& node : nodes_) {
-            executionQueue_.push(node.id);
+    // Build dependency graph (adjacency_ and indegree_)
+    adjacency_.clear();
+    indegree_.clear();
+
+    // Initialize indegree for all nodes
+    for (const auto& node : nodes_) {
+        indegree_[node.id] = 0;
+    }
+
+    // Build graph from edges
+    for (const auto& edge : edges_) {
+        const Port* fromPort = GetPort(edge.fromPortId);
+        const Port* toPort = GetPort(edge.toPortId);
+        
+        if (fromPort && toPort) {
+            int from = fromPort->nodeId;
+            int to = toPort->nodeId;
+            adjacency_[from].push_back(to);
+            // ensure keys exist
+            if (indegree_.find(to) == indegree_.end()) indegree_[to] = 0;
+            if (indegree_.find(from) == indegree_.end()) indegree_[from] = 0;
+            indegree_[to]++;
         }
     }
+
+    // Initialize ready queue with nodes that have indegree == 0
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        while (!readyQueue_.empty()) readyQueue_.pop();
+        for (const auto& p : indegree_) {
+            if (p.second == 0) readyQueue_.push(p.first);
+        }
+    }
+
+    // If no ready nodes but there are nodes, there may be a cycle -> abort execution
+    if (nodes_.size() > 0) {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (readyQueue_.empty()) {
+            std::cerr << "AIModel::StartExecution: no entry nodes (possible cycle). Aborting execution." << std::endl;
+            executing_ = false;
+            return;
+        }
+    }
+
+    remainingNodes_.store(static_cast<int>(nodes_.size()));
 
     // Start worker threads
     for (int i = 0; i < numThreads_; ++i) {
@@ -114,7 +498,11 @@ void AIModel::StartExecution(int numThreads) {
 }
 
 void AIModel::StopExecution() {
-    if (!executing_) return;
+    // Always join leftover threads regardless of executing_ state.
+    // If execution finished naturally, threads may be lingering.
+    if (workerThreads_.empty()) {
+        return;  // No threads to join
+    }
 
     executing_ = false;
 
@@ -130,6 +518,15 @@ void AIModel::StopExecution() {
 
     workerThreads_.clear();
 
+    // Clear scheduling structures
+    {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        while (!readyQueue_.empty()) readyQueue_.pop();
+    }
+    adjacency_.clear();
+    indegree_.clear();
+    remainingNodes_.store(0);
+
     std::cout << "Stopped AI model execution" << std::endl;
 }
 
@@ -137,23 +534,47 @@ void AIModel::ExecutionLoop() {
     while (executing_) {
         int nodeId = -1;
 
-        // Get next node to execute
+        // Get next ready node to execute
         {
             std::unique_lock<std::mutex> lock(queueMutex_);
             queueCondition_.wait(lock, [this]() {
-                return !executing_ || !executionQueue_.empty();
+                return !executing_ || !readyQueue_.empty();
             });
 
             if (!executing_) break;
 
-            if (!executionQueue_.empty()) {
-                nodeId = executionQueue_.front();
-                executionQueue_.pop();
+            if (!readyQueue_.empty()) {
+                nodeId = readyQueue_.front();
+                readyQueue_.pop();
             }
         }
 
         if (nodeId != -1) {
             ExecuteNode(nodeId);
+
+            // After executing, mark successors and push newly ready nodes
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            auto it = adjacency_.find(nodeId);
+            if (it != adjacency_.end()) {
+                for (int succ : it->second) {
+                    auto indegIt = indegree_.find(succ);
+                    if (indegIt != indegree_.end()) {
+                        indegIt->second--;
+                        if (indegIt->second == 0) {
+                            readyQueue_.push(succ);
+                            queueCondition_.notify_one();
+                        }
+                    }
+                }
+            }
+
+            remainingNodes_.fetch_sub(1);
+
+            // If we've finished all nodes, stop execution
+            if (remainingNodes_.load() <= 0) {
+                executing_ = false;
+                queueCondition_.notify_all();
+            }
         }
     }
 }

@@ -12,11 +12,11 @@ SyncManager::~SyncManager() {
 }
 
 void SyncManager::StartSync() {
-    if (running_) return;
+    // Do NOT start a background thread — callbacks are installed but actual
+    // sync (which touches UI) must run on the main thread to avoid
+    // modifying ImGui/ImNodes data from a background thread.
 
-    running_ = true;
-
-    // Set up callbacks
+    // Set up callbacks (they only set flags)
     editor_->SetNodeChangeCallback([this]() {
         std::lock_guard<std::mutex> lock(mutex_);
         editorChanged_ = true;
@@ -26,9 +26,6 @@ void SyncManager::StartSync() {
         std::lock_guard<std::mutex> lock(mutex_);
         modelChanged_ = true;
     });
-
-    // Start sync thread
-    syncThread_ = std::thread(&SyncManager::SyncLoop, this);
 }
 
 void SyncManager::StopSync() {
@@ -64,8 +61,6 @@ void SyncManager::SyncEditorToModel() {
         modelNode.id = editorNode.id;
         modelNode.name = editorNode.name;
         modelNode.type = "Generic"; // Default type, could be enhanced
-        modelNode.inputs = editorNode.inputs;
-        modelNode.outputs = editorNode.outputs;
         modelNode.boundUINodeId = editorNode.id; // Bind to UI node
         // Add default parameters
         modelNode.parameters = {{"position_x", std::to_string(editorNode.positionX)},
@@ -105,9 +100,9 @@ void SyncManager::SyncModelToEditor() {
     // Sync nodes from model to editor
     const auto& modelNodes = model_->GetNodes();
 
-    // Create mapping from AI node ID to UI node ID
-    std::map<int, int> aiToUiNodeMap;
-
+    // Note: boundAINodeId parameter in AddNode stores the AI model node ID
+    // The UI node ID will be created during ProcessDeferredOps (next frame)
+    // So we use the boundAINodeId to map connections later
     for (const auto& modelNode : modelNodes) {
         // Extract position from parameters if available
         float posX = 100.0f + (modelNode.id - 1) * 150.0f; // Default spacing
@@ -121,50 +116,47 @@ void SyncManager::SyncModelToEditor() {
             }
         }
 
+        // boundAINodeId stores the AI model's node ID for later connection mapping
         editor_->AddNode(modelNode.name, posX, posY, modelNode.id);
-
-        // Get the newly added UI node ID
-        const auto& uiNodes = editor_->GetNodes();
-        if (!uiNodes.empty()) {
-            int uiNodeId = uiNodes.back().id;
-            aiToUiNodeMap[modelNode.id] = uiNodeId;
-        }
     }
 
-    // Sync connections from model to editor
-    const auto& modelConnections = model_->GetConnections();
-    for (const auto& connection : modelConnections) {
-        int fromAiNode, toAiNode, fromOutput, toInput;
-        std::tie(fromAiNode, toAiNode, fromOutput, toInput) = connection;
-
-        // Map AI node IDs to UI node IDs
-        auto fromUiIt = aiToUiNodeMap.find(fromAiNode);
-        auto toUiIt = aiToUiNodeMap.find(toAiNode);
-
-        if (fromUiIt != aiToUiNodeMap.end() && toUiIt != aiToUiNodeMap.end()) {
-            int fromUiNode = fromUiIt->second;
-            int toUiNode = toUiIt->second;
-
-            // Find the correct attribute IDs
-            const auto& uiNodes = editor_->GetNodes();
-            int startAttr = -1, endAttr = -1;
-
-            for (const auto& uiNode : uiNodes) {
-                if (uiNode.id == fromUiNode) {
-                    if (!uiNode.outputs.empty()) {
-                        startAttr = uiNode.outputs[0]; // Use first output
+    // Get the current UI nodes after deferred add operations
+    // Note: This must be called BEFORE we try to connect them
+    // We need to manually process deferred ops here to ensure nodes exist
+    // Actually, let's defer connection add as well, so they happen after ProcessDeferredOps
+    
+    // Instead of trying to connect now, we'll queue the connections as deferred operations
+    // Store connections to be added after nodes are created
+    const auto& modelEdges = model_->GetEdges();
+    for (const auto& edge : modelEdges) {
+        const Port* fromPort = model_->GetPort(edge.fromPortId);
+        const Port* toPort = model_->GetPort(edge.toPortId);
+        
+        if (fromPort && toPort) {
+            // Find port indices within their nodes
+            int fromIdx = 0, toIdx = 0;
+            const auto& nodes = model_->GetNodes();
+            
+            for (const auto& node : nodes) {
+                if (node.id == fromPort->nodeId) {
+                    for (size_t i = 0; i < node.outputPorts.size(); i++) {
+                        if (node.outputPorts[i].id == fromPort->id) {
+                            fromIdx = i;
+                            break;
+                        }
                     }
                 }
-                if (uiNode.id == toUiNode) {
-                    if (!uiNode.inputs.empty()) {
-                        endAttr = uiNode.inputs[0]; // Use first input
+                if (node.id == toPort->nodeId) {
+                    for (size_t i = 0; i < node.inputPorts.size(); i++) {
+                        if (node.inputPorts[i].id == toPort->id) {
+                            toIdx = i;
+                            break;
+                        }
                     }
                 }
             }
-
-            if (startAttr != -1 && endAttr != -1) {
-                editor_->AddLink(fromUiNode, toUiNode, startAttr, endAttr);
-            }
+            
+            editor_->QueueConnectionForSync(fromPort->nodeId, toPort->nodeId, fromIdx, toIdx);
         }
     }
 

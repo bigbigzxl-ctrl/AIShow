@@ -199,6 +199,7 @@ public:
     void AddLink(int startNode, int endNode, int startAttr, int endAttr);
     void RemoveLink(int linkId);
     void UpdateNodePosition(int nodeId, float posX, float posY);
+    void QueueConnectionForSync(int fromAiNodeId, int toAiNodeId, int fromOutput, int toInput);
 
     // Element access
     UINode&       node(int node_id);
@@ -215,6 +216,13 @@ public:
     std::vector<Link> GetLinks() const;
 
     void SetNodeChangeCallback(std::function<void()> callback) { onNodeChange_ = callback; }
+    void SetSyncRequestCallback(std::function<void()> callback) { onSyncRequest_ = callback; }
+    void UpdateExecutionProgress(int nodeId, float progress, const std::string& status) {
+        executionProgress_[nodeId] = {progress, status};
+    }
+    void ClearExecutionProgress() {
+        executionProgress_.clear();
+    }
 
     GLFWwindow* GetWindow() { return window_; }
 
@@ -225,4 +233,32 @@ private:
     GLFWwindow* window_;
     ImNodesContext* imnodes_context_;
     std::function<void()> onNodeChange_;
+    std::function<void()> onSyncRequest_;
+
+    // Track execution progress for each AI node ID
+    struct ExecutionState {
+        float progress; // 0.0 to 1.0
+        std::string status; // "running", "completed", etc.
+    };
+    std::unordered_map<int, ExecutionState> executionProgress_;
+
+    // Deferred operations to avoid modifying ImNodes state during Render()
+    struct DeferredNodeOp {
+        enum Type { ADD, REMOVE } type;
+        std::string name;
+        float posX, posY;
+        int boundAINodeId;
+        int nodeId;
+    };
+    struct PendingConnection {
+        int fromAiNodeId;
+        int toAiNodeId;
+        int fromOutput;
+        int toInput;
+    };
+    std::vector<DeferredNodeOp> deferredOps_;
+    std::vector<DeferredNodeOp> pendingOps_; // Operations queued during this frame
+    std::vector<PendingConnection> pendingConnections_; // Connections to be made after nodes are created
+    void ProcessDeferredOps();
 };
+

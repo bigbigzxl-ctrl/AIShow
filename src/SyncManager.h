@@ -26,10 +26,12 @@ public:
         executionProgressCallback_ = callback;
     }
 
-private:
-    void SyncLoop();
+    // Allow main/UI thread to drive pending syncs
     void HandleEditorChanges();
     void HandleModelChanges();
+
+private:
+    void SyncLoop();
     void HandleExecutionProgress(const ExecutionProgress& progress);
 
     NodeEditor* editor_;
